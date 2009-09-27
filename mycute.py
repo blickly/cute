@@ -24,12 +24,27 @@ class stackelt:
     self.branch = branch
     self.done = False
 
+  def __str__(self):
+    return "(" + self.branch + "," + str(self.done) + ")"
+
+def debuginfo():
+  print "stack:"
+  for i in stack:
+    print i
+
 if os.path.exists('stack'):
-  stackfile = open('stack', 'r+b')
+  stackfile = open('stack', 'rb')
   stack = cPickle.load(stackfile)
+  stackfile.close()
 else:
   stack = []
-  stackfile = open('stack', 'wb')
+
+if os.path.exists('seenbranches'):
+  branchfile = open('seenbranches', 'rb')
+  seenbranches = cPickle.load(branchfile)
+  branchfile.close()
+else:
+  seenbranches = set()
 
 def bounds():
   sizes = {"char":8, "short":16, "int":32, "long":64, "long long":128}
@@ -41,38 +56,23 @@ def bounds():
 
 def main():
   bounds()
-  runYices(generateYicesInput(readTrace()))
-  #print "A:",A
+  runProgram()
+  stackfile = open('stack', 'wb')
   cPickle.dump(stack, stackfile)
   stackfile.close()
+  branchfile = open('seenbranches', 'wb')
+  cPickle.dump(seenbranches, branchfile)
+  branchfile.close()
   return 1
 
-def readTrace():
-  assignment = re.compile("""
-      \((?P<laddr>\w+),(?P<lval>-?\w+)\)
-      \s=\s
-        (\((?P<type>[ a-z]+)\))?
-      \((?P<raddr>\w+),(?P<rval>-?\w+)\)
-      $""", re.VERBOSE)
-  operation = re.compile("""
-      \((?P<laddr>\w+),(?P<lval>-?\w+)\)
-      \s=\s
-      \((?P<raddr1>\w+),(?P<rval1>-?\w+)\)
-      \s(?P<op>\S)\s
-      \((?P<raddr2>\w+),(?P<rval2>-?\w+)\)
-      $""", re.VERBOSE)
-  branch = re.compile("""
-      (?P<dir>\w+):(?P<num>\d+)\s
-      \((?P<addr1>\w+),(?P<val1>-?\w+)\)
-      \s(?P<op>\S+)\s
-      \((?P<addr2>\w+),(?P<val2>-?\w+)\)""", re.VERBOSE)
+def runProgram():
+  (assignment, operation, branch) = regexCompile()
   defineConstraints = ""
   branchConstraints = []
   k = 0
   for line in open('trace', 'r'):
     ma = assignment.match(line)
     mo = operation.match(line)
-    mb = branch.match(line)
     mb = branch.match(line)
     if ma:
       defineConstraints += matched_assignment(ma.groupdict())
@@ -81,37 +81,49 @@ def readTrace():
       pass
     elif mb:
       d = mb.groupdict()
+      seenbranches.add(d["num"])
       c = matched_branch(d)
+      if c != None:
+        branchConstraints.append(c)
       updateStack(d["dir"], k)
-      #if d["num"] < stacksize:
-        #c = negateCons(c)
-        #pass
-      branchConstraints.append(c)
       k = k + 1
     else:
       print "Failed to match line: <" + line + ">"
-  branchConstraints = negateLastBranch(k, branchConstraints)
-  return defineConstraints + \
-      reduce(lambda x, y: x+ "(assert " + y + ")\n", branchConstraints, "")
+  return solveConstraints(k, defineConstraints, branchConstraints)
 
-def negateLastBranch(k, constraints):
-  for j in range(k-1, -1, -1):
+def solveConstraints(k, dConstraints, constraints):
+  print "========== In solve path constraint ===="
+  debuginfo()
+  print "k:",k
+  for j in range(k-1, -2, -1):
     if stack[j].done == False:
       break
-    elif j == 0:
-      print "Done with search!"
+  if j == -1:
+    print "Done with search!"
+    return 1
+  print "j:",j, constraints[j], stack[j]
   constraints[j] = negateCons(constraints[j])
   stack[j].branch = negateDir(stack[j].branch)
-  return constraints
-
+  del constraints[j+1:]
+  del stack[j+1:]
+  if runYices(dConstraints + \
+      reduce(lambda x, y: x+ "(assert " + y + ")\n", constraints, "")):
+    print constraints
+    debuginfo()
+    return 0
+  else:
+    return solveConstraints(j, dConstraints, constraints)
+  
 
 def updateStack(branch, k):
+  print "=== update stack === (k=",k," stack size=", len(stack), ")"
+  debuginfo()
   if k < len(stack):
-    if stack[k].branch == branch:
-      print "Error"
+    if stack[k].branch != branch:
+      raise Exception('try new inputs')
     elif k == len(stack) - 1:
       stack[k].branch = branch
-      stack[k].branch = True
+      stack[k].done = True
   else:
     stack.append(stackelt(branch))
 
@@ -139,39 +151,30 @@ def matched_assignment(d):
   return ""
 
 def matched_operation(d):
-  #print "operation:",d
-  isSymbolic1, isSymbolic2 = d["raddr1"] in A, d["raddr2"] in A
-  if isSymbolic1 and isSymbolic2 and d["op"] != "*":
-    A[d["laddr"]] = "(" + d["op"] +\
-        " " + A[d["raddr1"]] + " " + A[d["raddr2"]] + ")"
-  elif isSymbolic1:
-    A[d["laddr"]] = "(" + d["op"] +\
-        " " + A[d["raddr1"]] + " " + d["rval2"] + ")"
-  elif isSymbolic2:
-    A[d["laddr"]] = "(" + d["op"] +\
-        " " + d["rval1"] + " " + A[d["raddr2"]] + ")"
-  elif d["laddr"] in A:
-    del A[d["laddr"]]
+  A[d["laddr"]] = symbolic_expression(d)
+  #if A[d["laddr"]] == None:
+  #  del A[d["laddr"]]
 
-def matched_branch(d):
-  isSymbolic1, isSymbolic2 = d["addr1"] in A, d["addr2"] in A
+def symbolic_expression(d):
+  isSymbolic1, isSymbolic2 = d["raddr1"] in A, d["raddr2"] in A
   if d["op"] == "==":
     d["op"] = "="
   if d["op"] == "!=":
     d["op"] = "/="
-  if isSymbolic1 and isSymbolic2:
-    c = "(" + d["op"] +\
-        " " + A[d["addr1"]] + " " + A[d["addr2"]] + ")"
+  if isSymbolic1 and isSymbolic2 and d["op"] != "*":
+    arg1, arg2 = A[d["raddr1"]], A[d["raddr2"]]
   elif isSymbolic1:
-    c = "(" + d["op"] +\
-        " " + A[d["addr1"]] + " " + d["val2"] + ")"
+    arg1, arg2 = A[d["raddr1"]], d["rval2"]
   elif isSymbolic2:
-    c = "(" + d["op"] +\
-        " " + d["val1"] + " " + A[d["addr2"]] + ")"
+    arg1, arg2 = d["rval1"], A[d["raddr2"]]
   else:
-    return "true"
+    arg1, arg2 = d["rval1"], d["rval2"]
+  return "(" + d["op"] + " " + arg1 + " " + arg2 + ")"
 
-  if d["dir"] == "then":
+def matched_branch(d):
+  c = symbolic_expression(d)
+
+  if d["dir"] == "then" or c == None:
     return c
   elif d["dir"] == "else":
     return negateCons(c)
@@ -183,12 +186,43 @@ def generateYicesInput(str):
           + str
           + "(check)\n")
 
-def runYices(yicesInput):
+def runYices(yicesConstraints):
+  yicesInput = generateYicesInput(yicesConstraints)
   f = open('yicesIn', 'w')
   f.write(yicesInput)
   f.close()
   f = open('input', 'w')
   subprocess.call([yices, 'yicesIn'], stdout=f)
+  f.close()
+  f = open('input', 'r')
+  firstline = f.readline()
+  f.close()
+  sucess = firstline == 'sat\n'
+  print firstline, sucess
+  return sucess
+
+def regexCompile():
+  assignment = re.compile("""
+      \((?P<laddr>\w+),(?P<lval>-?\w+)\)
+      \s=\s
+        (\((?P<type>[ a-z]+)\))?
+      \((?P<raddr>\w+),(?P<rval>-?\w+)\)
+      $""", re.VERBOSE)
+  operation = re.compile("""
+      \((?P<laddr>\w+),(?P<lval>-?\w+)\)
+      \s=\s
+      \((?P<raddr1>\w+),(?P<rval1>-?\w+)\)
+      \s(?P<op>\S)\s
+      \((?P<raddr2>\w+),(?P<rval2>-?\w+)\)
+      $""", re.VERBOSE)
+  branch = re.compile("""
+      (?P<dir>\w+):(?P<num>\d+)\s
+      \((?P<raddr1>\w+),(?P<rval1>-?\w+)\)
+      \s(?P<op>\S+)\s
+      \((?P<raddr2>\w+),(?P<rval2>-?\w+)\)""", re.VERBOSE)
+  return (assignment, operation, branch)
+
+
 
 if __name__ == "__main__":
   sys.exit(main())
