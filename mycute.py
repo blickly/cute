@@ -12,12 +12,9 @@ import os
 import subprocess
 import re
 import cPickle
+import random
 
 yices = "../yices-linux32/bin/yices"
-
-MAX = {}
-MIN = {}
-A = {}
 
 class stackelt:
   def __init__(self, branch):
@@ -27,202 +24,268 @@ class stackelt:
   def __str__(self):
     return "(" + self.branch + "," + str(self.done) + ")"
 
-def debuginfo():
-  print "stack:"
-  for i in stack:
-    print i
+def pickle(filename, obj):
+  file = open(filename, 'wb')
+  cPickle.dump(obj, file)
+  file.close()
 
-if os.path.exists('stack'):
-  stackfile = open('stack', 'rb')
-  stack = cPickle.load(stackfile)
-  stackfile.close()
-else:
-  stack = []
+def unpickle(filename):
+  file = open(filename, 'rb')
+  obj = cPickle.load(file)
+  file.close()
+  return obj
 
-if os.path.exists('seenbranches'):
-  branchfile = open('seenbranches', 'rb')
-  seenbranches = cPickle.load(branchfile)
-  branchfile.close()
-else:
-  seenbranches = set()
+class mycute:
+  random.seed(95)
+  MAX = {}
+  MIN = {}
 
-def bounds():
-  sizes = {"char":8, "short":16, "int":32, "long":64, "long long":128}
-  for (type, size) in sizes.items():
-    MAX[type] = str(2 ** (size-1) - 1)
-    MIN[type] = str(-(2** (size-1)))
-    MAX["unsigned " + type] = str(2 ** (size) - 1)
-    MIN["unsigned " + type] = '0'
+  def __init__(self):
+    self.bounds()
+    self.A = {}
+    self.debug = False
+    self.clearstack = False
 
-def main():
-  bounds()
-  runProgram()
-  stackfile = open('stack', 'wb')
-  cPickle.dump(stack, stackfile)
-  stackfile.close()
-  branchfile = open('seenbranches', 'wb')
-  cPickle.dump(seenbranches, branchfile)
-  branchfile.close()
-  return 1
+    self.stack = []
+    if os.path.exists('stack'):
+      self.stack = unpickle('stack')
 
-def runProgram():
-  (assignment, operation, branch) = regexCompile()
-  defineConstraints = ""
-  branchConstraints = []
-  k = 0
-  for line in open('trace', 'r'):
-    ma = assignment.match(line)
-    mo = operation.match(line)
-    mb = branch.match(line)
-    if ma:
-      defineConstraints += matched_assignment(ma.groupdict())
-    elif mo:
-      matched_operation(mo.groupdict())
-      pass
-    elif mb:
-      d = mb.groupdict()
-      seenbranches.add(d["num"])
-      c = matched_branch(d)
-      if c != None:
-        branchConstraints.append(c)
-      updateStack(d["dir"], k)
-      k = k + 1
+    self.seenbranches = set()
+    if os.path.exists('seenbranches'):
+      self.seenbranches = unpickle('seenbranches')
+    self.prevseen = self.seenbranches
+
+  def bounds(self):
+    sizes = {"char":8, "short":16, "int":32, "long":64, "long long":128}
+    for (type, size) in sizes.items():
+      mycute.MAX[type] = str(2 ** (size-1) - 1)
+      mycute.MIN[type] = str(-(2** (size-1)))
+      mycute.MAX["unsigned " + type] = str(2 ** (size) - 1)
+      mycute.MIN["unsigned " + type] = '0'
+
+  def debuginfo(self):
+    print "stack:"
+    for i in self.stack:
+      print i
+
+  def main(self):
+    print "mycute started...",
+    retval = self.runProgram()
+    if retval == 1:
+      try:
+        os.unlink('stack')
+        os.unlink('seenbranches')
+      except:
+        pass
     else:
-      print "Failed to match line: <" + line + ">"
-  return solveConstraints(k, defineConstraints, branchConstraints)
+      pickle('stack', self.stack)
+      pickle('seenbranches', self.seenbranches)
+    total = int(open('branchcount').read())
+    seen = len(self.seenbranches)
+    print "Branch coverage: %d/%d (%.2f%%)" % (seen, total, 100.0*seen/total)
+    if self.clearstack:
+      try:
+        os.unlink('stack')
+      except:
+        pass
+    return retval
 
-def solveConstraints(k, dConstraints, constraints):
-  print "========== In solve path constraint ===="
-  debuginfo()
-  print "k:",k
-  for j in range(k-1, -2, -1):
-    if stack[j].done == False:
-      break
-  if j == -1:
-    print "Done with search!"
-    return 1
-  print "j:",j, constraints[j], stack[j]
-  constraints[j] = negateCons(constraints[j])
-  stack[j].branch = negateDir(stack[j].branch)
-  del constraints[j+1:]
-  del stack[j+1:]
-  if runYices(dConstraints + \
-      reduce(lambda x, y: x+ "(assert " + y + ")\n", constraints, "")):
-    print constraints
-    debuginfo()
-    return 0
-  else:
-    return solveConstraints(j, dConstraints, constraints)
-  
+  def runProgram(self):
+    (assignment, operation, branch) = self.regexCompile()
+    defineConstraints = []
+    branchConstraints = []
+    k = 0
+    for line in open('trace', 'r'):
+      ma = assignment.match(line)
+      mo = operation.match(line)
+      mb = branch.match(line)
+      if ma:
+        defineConstraints += self.matched_assignment(ma.groupdict())
+      elif mo:
+        self.matched_operation(mo.groupdict())
+        pass
+      elif mb:
+        d = mb.groupdict()
+        self.seenbranches.add(d["num"])
+        c = self.matched_branch(d)
+        if c == None:
+          branchConstraints.append("true")
+        else:
+          branchConstraints.append(c)
+        self.updatestack(d["dir"], k)
+        k = k + 1
+      else:
+        print "Failed to match line: <" + line + ">"
+    return self.solveConstraints(k, defineConstraints, branchConstraints)
 
-def updateStack(branch, k):
-  print "=== update stack === (k=",k," stack size=", len(stack), ")"
-  debuginfo()
-  if k < len(stack):
-    if stack[k].branch != branch:
-      raise Exception('try new inputs')
-    elif k == len(stack) - 1:
-      stack[k].branch = branch
-      stack[k].done = True
-  else:
-    stack.append(stackelt(branch))
+  def solveConstraints(self, k, dConstraints, constraints):
+    if self.debug:
+      print "========== In solve path constraint ===="
+      self.debuginfo()
+      print "k:",k
+    if self.seenbranches == self.prevseen and random.randrange(100) < 3:
+      return self.randomSolve(k, dConstraints, constraints)
+    changePoints = [i for i in xrange(k) if self.stack[i].done == False]
+    if changePoints == []:
+      print "Done with search!"
+      return 1
+    j = max(changePoints)
+    self.stack[j].branch = self.negateDir(self.stack[j].branch)
+    del constraints[j+1:]
+    del self.stack[j+1:]
+    if self.debug:
+      print "j:",j, constraints[j], self.stack[j]
+    constraints[j] = self.negateCons(constraints[j])
+    if self.satisfiable(dConstraints, constraints):
+      if self.debug:
+        print constraints
+        self.debuginfo()
+      return 0
+    else:
+      return self.solveConstraints(j, dConstraints, constraints)
 
-def negateCons(c):
-  return "(not " + c + ")"
+  def randomSolve(self, k, dCons, bCons):
+    if self.debug:
+      print "in randomSolve..."
+    self.clearstack = True
+    while True:
+      changePoints = [i for i in xrange(k)
+          if self.stack[i].done == False and bCons[i] != "true"]
+      if changePoints == []:
+        if self.debug:
+           print "*ALL RANDOM*"
+        bCons = []
+        for (var, t) in dCons:
+          val = random.randrange(int(mycute.MIN[t]), int(mycute.MAX[t]))
+          bCons.append("(= " + var + " " + str(val) + ")")
+        assert self.satisfiable(dCons, bCons)
+        return 0
+      j = random.choice(changePoints)
+      bCons[j] = self.negateCons(bCons[j])
+      self.stack[j].branch = self.negateDir(self.stack[j].branch)
+      del bCons[j+1:]
+      del self.stack[j+1:]
+      k = j
+      if self.satisfiable(dCons, bCons):
+        return 0
 
-def negateDir(d):
-  if d == "then":
-    return "else"
-  elif d == "else":
-    return "then"
+  def satisfiable(self, dCons, bCons):
+    if self.negateCons(bCons[-1]) in bCons:
+      return False
+    return self.runYices(dCons, bCons)
 
-def matched_assignment(d):
-  if d["type"]:
-    var = d["raddr"]
-    t = d["type"]
-    A[d["laddr"]] = var
-    return ("(define " + var + "::int)\n"
-                   "(assert (<= " + var + " " + MAX[t] +"))\n"
-                   "(assert (>= " + var + " " + MIN[t] +"))\n")
-  if d["raddr"] in A:
-    A[d["laddr"]] = A[d["raddr"]]
-  elif d["laddr"] in A:
-    del A[d["laddr"]]
-  return ""
+  def updatestack(self, branch, k):
+    if self.debug:
+      print "=== updatestack === (k=",k," stack size=", len(self.stack), ")"
+      self.debuginfo()
+    if k < len(self.stack):
+      if self.stack[k].branch != branch:
+        raise Exception('try new inputs')
+      elif k == len(self.stack) - 1:
+        self.stack[k].branch = branch
+        self.stack[k].done = True
+    else:
+      self.stack.append(stackelt(branch))
 
-def matched_operation(d):
-  A[d["laddr"]] = symbolic_expression(d)
-  #if A[d["laddr"]] == None:
-  #  del A[d["laddr"]]
+  def negateCons(self, c):
+    if c[:5] == "(not " and c[-1] == ")":
+      return c[5:-1]
+    else:
+      return "(not " + c + ")"
 
-def symbolic_expression(d):
-  isSymbolic1, isSymbolic2 = d["raddr1"] in A, d["raddr2"] in A
-  if d["op"] == "==":
-    d["op"] = "="
-  if d["op"] == "!=":
-    d["op"] = "/="
-  if isSymbolic1 and isSymbolic2 and d["op"] != "*":
-    arg1, arg2 = A[d["raddr1"]], A[d["raddr2"]]
-  elif isSymbolic1:
-    arg1, arg2 = A[d["raddr1"]], d["rval2"]
-  elif isSymbolic2:
-    arg1, arg2 = d["rval1"], A[d["raddr2"]]
-  else:
-    arg1, arg2 = d["rval1"], d["rval2"]
-  return "(" + d["op"] + " " + arg1 + " " + arg2 + ")"
+  def negateDir(self, d):
+    if d == "then":
+      return "else"
+    elif d == "else":
+      return "then"
 
-def matched_branch(d):
-  c = symbolic_expression(d)
+  def matched_assignment(self, d):
+    if d["type"]:
+      var = d["raddr"]
+      self.A[d["laddr"]] = var
+      return [(var, d["type"])]
+    if d["raddr"] in self.A:
+      self.A[d["laddr"]] = self.A[d["raddr"]]
+    else:
+      self.A.pop(d["laddr"], None)
+    return []
 
-  if d["dir"] == "then" or c == None:
-    return c
-  elif d["dir"] == "else":
-    return negateCons(c)
-  else:
-    print "Unknown direction:",d["dir"]
+  def matched_operation(self, d):
+    e = self.symbolic_expression(d)
+    if e == None:
+      self.A.pop(d["laddr"], None)
+    else:
+      self.A[d["laddr"]] = e
 
-def generateYicesInput(str):
-  return ("(set-evidence! true)\n"
-          + str
-          + "(check)\n")
+  def symbolic_expression(self, d):
+    isSymbolic1, isSymbolic2 = d["raddr1"] in self.A, d["raddr2"] in self.A
+    if d["op"] == "==":
+      d["op"] = "="
+    if d["op"] == "!=":
+      d["op"] = "/="
+    if isSymbolic1 and isSymbolic2 and d["op"] != "*":
+      arg1, arg2 = self.A[d["raddr1"]], self.A[d["raddr2"]]
+    elif isSymbolic1:
+      arg1, arg2 = self.A[d["raddr1"]], d["rval2"]
+    elif isSymbolic2:
+      arg1, arg2 = d["rval1"], self.A[d["raddr2"]]
+    else:
+      #arg1, arg2 = d["rval1"], d["rval2"]
+      return None
+    return "(" + d["op"] + " " + arg1 + " " + arg2 + ")"
 
-def runYices(yicesConstraints):
-  yicesInput = generateYicesInput(yicesConstraints)
-  f = open('yicesIn', 'w')
-  f.write(yicesInput)
-  f.close()
-  f = open('input', 'w')
-  subprocess.call([yices, 'yicesIn'], stdout=f)
-  f.close()
-  f = open('input', 'r')
-  firstline = f.readline()
-  f.close()
-  sucess = firstline == 'sat\n'
-  print firstline, sucess
-  return sucess
+  def matched_branch(self, d):
+    c = self.symbolic_expression(d)
+    if d["dir"] == "then" or c == None:
+      return c
+    elif d["dir"] == "else":
+      return self.negateCons(c)
+    else:
+      print "Unknown direction:",d["dir"]
 
-def regexCompile():
-  assignment = re.compile("""
-      \((?P<laddr>\w+),(?P<lval>-?\w+)\)
-      \s=\s
-        (\((?P<type>[ a-z]+)\))?
-      \((?P<raddr>\w+),(?P<rval>-?\w+)\)
-      $""", re.VERBOSE)
-  operation = re.compile("""
-      \((?P<laddr>\w+),(?P<lval>-?\w+)\)
-      \s=\s
-      \((?P<raddr1>\w+),(?P<rval1>-?\w+)\)
-      \s(?P<op>\S)\s
-      \((?P<raddr2>\w+),(?P<rval2>-?\w+)\)
-      $""", re.VERBOSE)
-  branch = re.compile("""
-      (?P<dir>\w+):(?P<num>\d+)\s
-      \((?P<raddr1>\w+),(?P<rval1>-?\w+)\)
-      \s(?P<op>\S+)\s
-      \((?P<raddr2>\w+),(?P<rval2>-?\w+)\)""", re.VERBOSE)
-  return (assignment, operation, branch)
+  def runYices(self, dCons, bCons):
+    yicesInput = "(set-evidence! true)\n"
+    for (var, t) in dCons:
+      yicesInput += "(define " + var + "::int)\n" + \
+                    "(assert (<= " + var + " " + mycute.MAX[t] +"))\n" + \
+                    "(assert (>= " + var + " " + mycute.MIN[t] +"))\n"
+    for line in bCons:
+      yicesInput += "(assert " + line + ")\n"
+    yicesInput += "(check)\n"
+    f = open('yicesIn', 'w')
+    f.write(yicesInput)
+    f.close()
+    f = open('input', 'w')
+    subprocess.call([yices, 'yicesIn'], stdout=f)
+    f.close()
+    f = open('input', 'r')
+    firstline = f.readline()
+    f.close()
+    if self.debug:
+      print firstline
+    return (firstline == 'sat\n')
 
-
+  def regexCompile(self):
+    assignment = re.compile("""
+        \((?P<laddr>\w+),(?P<lval>-?\w+)\)
+        \s=\s
+          (\((?P<type>[ a-z]+)\))?
+        \((?P<raddr>\w+),(?P<rval>-?\w+)\)
+        $""", re.VERBOSE)
+    operation = re.compile("""
+        \((?P<laddr>\w+),(?P<lval>-?\w+)\)
+        \s=\s
+        \((?P<raddr1>\w+),(?P<rval1>-?\w+)\)
+        \s(?P<op>\S+)\s
+        \((?P<raddr2>\w+),(?P<rval2>-?\w+)\)
+        $""", re.VERBOSE)
+    branch = re.compile("""
+        (?P<dir>\w+):(?P<num>\d+)\s
+        \((?P<raddr1>\w+),(?P<rval1>-?\w+)\)
+        \s(?P<op>\S+)\s
+        \((?P<raddr2>\w+),(?P<rval2>-?\w+)\)""", re.VERBOSE)
+    return (assignment, operation, branch)
 
 if __name__ == "__main__":
-  sys.exit(main())
+  cute = mycute()
+  sys.exit(cute.main())
