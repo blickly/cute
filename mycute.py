@@ -215,6 +215,8 @@ class mycute:
     if e == None:
       self.A.pop(d["laddr"], None)
     else:
+      if d["op"] in ["=","/=","==","!=","<",">","<=",">="]:
+        e = "(if " + e + " 1 0)"
       self.A[d["laddr"]] = e
 
   def symbolic_expression(self, d):

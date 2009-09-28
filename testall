@@ -1,0 +1,22 @@
+#!/bin/bash
+
+../cutec testme.c
+../cute $1 testme -i 3
+rm -f stack seenbranches input
+
+../cutec qsort.c
+../cute $1 qsort -i 120
+rm -f stack seenbranches input
+
+../cutec mem.c 
+../cute $1 mem -i 2
+rm -f stack seenbranches input
+
+../cutec solve.c 
+../cute $1 solve -i 4
+rm -f stack seenbranches input
+
+../cutec var_num_inputs.c 
+../cute $1 var_num_inputs -i 5
+rm -f stack seenbranches input
+
